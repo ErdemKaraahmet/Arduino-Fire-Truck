@@ -1,49 +1,91 @@
 #include <Dabble.h>
-
 #include <Servo.h>
+#include <EEPROM.h>
 
-Servo bottomServo;  // Horizontal (left-right)
-Servo topServo;     // Vertical (up-down)
+Servo bottomServo;
+Servo topServo;
+Servo tankDoorServo;
+
 int bottomServoValue = 90;
 int topServoValue = 90;
+
+#define BOTTOM_SERVO_ADDR 0
+#define TOP_SERVO_ADDR 1
+#define SPEED_MODE_ADDR 2
 
 #define TRIG_PIN A1
 #define ECHO_PIN A2
 
-// Motor control pins
-#define ENA 2
-#define IN1 7
-#define IN2 6
+#define ENA 3
+#define IN1 6
+#define IN2 7
+#define ENB 5
+#define IN3 12
+#define IN4 11
 
-#define ENB 3
-#define IN3 4
-#define IN4 5
+int speed = 400;
+bool isFastMode = true;
+bool lastSelectState = false;
 
-int speed = 200;
+int PumpPin = 8;
+bool pumpRunning = false;
+unsigned long pumpStartTime = 0;
+const unsigned long pumpDuration = 5000;
+bool lastStartState = false;
 
 int waterSensorPin = A0;
 
 int redLed = 13;
-int yellowLed = 12;
-int greenLed = 11;
+int yellowLed = A3;
+int greenLed = A4;
+
+volatile bool moveable = true;
+volatile bool dryrun = false;
+
+const int tankButtonPin = 2;
+volatile bool doorShouldBeOpen = false;
+volatile bool doorStateChanged = false;
+
+unsigned long lastSensorCheck = 0;
+const unsigned long sensorInterval = 300;
+
+// ===== Door Button ISR =====
+void tankButtonISR() {
+  doorShouldBeOpen = (digitalRead(tankButtonPin) == LOW);
+  doorStateChanged = true;
+}
 
 void setup() {
-  Serial.begin(9600);        // Start hardware Serial for Bluetooth
-  Dabble.begin(Serial);      // Use Dabble with hardware Serial
+  Serial.begin(9600);
+  Dabble.begin(Serial);
 
-  bottomServo.attach(9);   // Bottom servo to pin 9
-  topServo.attach(8);     // Top servo to pin 8
+  bottomServoValue = EEPROM.read(BOTTOM_SERVO_ADDR);
+  topServoValue = EEPROM.read(TOP_SERVO_ADDR);
 
-  //Ultrasonic 
+  byte savedMode = EEPROM.read(SPEED_MODE_ADDR);
+  isFastMode = (savedMode == 1);
+  speed = isFastMode ? 255 : 120;
+
+  if (bottomServoValue < 0 || bottomServoValue > 180) bottomServoValue = 90;
+  if (topServoValue < 0 || topServoValue > 180) topServoValue = 90;
+
+  bottomServo.attach(9);
+  topServo.attach(10);
+  bottomServo.write(bottomServoValue);
+  topServo.write(topServoValue);
+
+  tankDoorServo.attach(A5);
+  tankDoorServo.write(0);  
+  pinMode(tankButtonPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(tankButtonPin), tankButtonISR, CHANGE);
+
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  
-  //Leds
+
   pinMode(redLed, OUTPUT);
   pinMode(yellowLed, OUTPUT);
   pinMode(greenLed, OUTPUT);
 
-  // Setup motor pins
   pinMode(ENA, OUTPUT);
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
@@ -51,165 +93,147 @@ void setup() {
   pinMode(IN3, OUTPUT);
   pinMode(IN4, OUTPUT);
 
-  stopMotors();  // Prevent motors from running on boot
+  pinMode(PumpPin, OUTPUT);
+  digitalWrite(PumpPin, HIGH);
+
+  stopMotors();
 }
 
 void loop() {
-  Dabble.processInput();     // Refresh Dabble input
-
-
-  //Speed Setting
-  if(GamePad.isSelectPressed()) {
-    if(speed >= 400) {
-      speed = 200;
-    }
-    else {
-      speed += 100;
+  if (doorStateChanged) {
+    doorStateChanged = false;
+    if (doorShouldBeOpen) {
+      tankDoorServo.write(90);
+      Serial.println("Door Opened");
+    } else {
+      tankDoorServo.write(0);
+      Serial.println("Door Closed");
     }
   }
 
-  //Water
-  int level = analogRead(waterSensorPin);
-  Serial.print("Water Level: ");
-  Serial.println(level);
+  Dabble.processInput();
 
-  if (level > 500) {
-    digitalWrite(redLed, LOW);
-    digitalWrite(yellowLed, LOW);
-    digitalWrite(greenLed, HIGH);
-  }
-  else if (level > 300) {
-    digitalWrite(redLed, LOW);
-    digitalWrite(yellowLed, HIGH);
-    digitalWrite(greenLed, LOW);
-  }
-  else {
-    digitalWrite(redLed, HIGH);
-    digitalWrite(yellowLed, LOW);
-    digitalWrite(greenLed, LOW);
-  }
+  if (millis() - lastSensorCheck >= sensorInterval) {
+    lastSensorCheck = millis();
 
-  //Ultrasonic 
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
 
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
-  float distance = duration * 0.034 / 2;
+    long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+    float distance = duration * 0.034 / 2;
+    moveable = (distance >= 10);
 
-  if (distance > 2 && distance < 400) {
-    Serial.print("Distance: ");
-    Serial.print(distance);
-    Serial.println(" cm");
-  } else {
-    Serial.println("Out of range");
-  }
+    int waterLevel = analogRead(waterSensorPin);
+    dryrun = (waterLevel < 300);
 
-   //Servo Motors
-  if(GamePad.isTrianglePressed()) {
-    if(bottomServoValue < 120) {
-    bottomServoValue++;
+    if (waterLevel > 500) {
+      digitalWrite(redLed, LOW);
+      digitalWrite(greenLed, HIGH);
+      digitalWrite(yellowLed, LOW);
+    } else if (waterLevel > 300) {
+      digitalWrite(redLed, LOW);
+      digitalWrite(greenLed, LOW);
+      digitalWrite(yellowLed, HIGH);
+    } else {
+      digitalWrite(redLed, HIGH);
+      digitalWrite(greenLed, LOW);
+      digitalWrite(yellowLed, LOW);
     }
-    Serial.println("Bottom Servo ++");
-    Serial.println(bottomServoValue);
-    bottomServo.write(bottomServoValue);
+  }
+
+  bool currentSelectState = GamePad.isSelectPressed();
+  if (currentSelectState && !lastSelectState) {
+    isFastMode = !isFastMode;
+    speed = isFastMode ? 255 : 120;
+    EEPROM.write(SPEED_MODE_ADDR, isFastMode ? 1 : 0);
+  }
+  lastSelectState = currentSelectState;
+
+  if (GamePad.isTrianglePressed()) {
+    if (bottomServoValue < 120) {
+      bottomServoValue++;
+      bottomServo.write(bottomServoValue);
+      EEPROM.write(BOTTOM_SERVO_ADDR, bottomServoValue);
+    }
     delay(50);
-  } 
-  else if (GamePad.isCrossPressed()){
-    if(bottomServoValue > 60) {
-    bottomServoValue--;
+  } else if (GamePad.isCrossPressed()) {
+    if (bottomServoValue > 60) {
+      bottomServoValue--;
+      bottomServo.write(bottomServoValue);
+      EEPROM.write(BOTTOM_SERVO_ADDR, bottomServoValue);
     }
-    Serial.println("Bottom Servo --");
-    Serial.println(bottomServoValue);
-    bottomServo.write(bottomServoValue);
     delay(50);
-  }
-  else if (GamePad.isSquarePressed()) {
-    if(topServoValue < 140) {
-    topServoValue++;
+  } else if (GamePad.isSquarePressed()) {
+    if (topServoValue < 140) {
+      topServoValue++;
+      topServo.write(topServoValue);
+      EEPROM.write(TOP_SERVO_ADDR, topServoValue);
     }
-     Serial.println("topServoValue++");
-     Serial.println(topServoValue);
-    topServo.write(topServoValue);
     delay(50);
-  }
-  else if (GamePad.isCirclePressed()) {
-    if(topServoValue > 50) {
-    topServoValue--;
+  } else if (GamePad.isCirclePressed()) {
+    if (topServoValue > 50) {
+      topServoValue--;
+      topServo.write(topServoValue);
+      EEPROM.write(TOP_SERVO_ADDR, topServoValue);
     }
-     Serial.println("topServoValue--");
-     Serial.println(topServoValue);
-    topServo.write(topServoValue);
     delay(50);
   }
 
-
-  // if (GamePad.isUpPressed() && distance > 30)   ---> to implement the distance limit
-  if (GamePad.isUpPressed()) {
+  if (GamePad.isUpPressed() && moveable) {
     moveForward(speed);
-  } 
-  else if (GamePad.isDownPressed()) {
+  } else if (GamePad.isDownPressed()) {
     moveBackward(speed);
-  } 
-  else if (GamePad.isLeftPressed()) {
+  } else if (GamePad.isLeftPressed()) {
     turnLeft(speed);
-  } 
-  else if (GamePad.isRightPressed()) {
+  } else if (GamePad.isRightPressed()) {
     turnRight(speed);
-  } 
-  else {
+  } else {
     stopMotors();
   }
 
+  if (!dryrun) {
+    bool currentStartState = GamePad.isStartPressed();
+    if (currentStartState && !lastStartState && !pumpRunning) {
+      pumpRunning = true;
+      pumpStartTime = millis();
+      digitalWrite(PumpPin, LOW);
+    }
 
+    if (pumpRunning && (millis() - pumpStartTime >= pumpDuration)) {
+      digitalWrite(PumpPin, HIGH);
+      pumpRunning = false;
+    }
 
+    lastStartState = currentStartState;
+  }
 }
 
-// ---- Motor control functions ----
-
+// ----- Motor Functions -----
 void moveForward(int speed) {
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENA, speed);
-  analogWrite(ENB, speed);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed); analogWrite(ENB, speed);
 }
-
 void moveBackward(int speed) {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
-  analogWrite(ENA, speed);
-  analogWrite(ENB, speed);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  analogWrite(ENA, speed); analogWrite(ENB, speed);
 }
-
 void turnLeft(int speed) {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENA, speed);
-  analogWrite(ENB, speed);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed); analogWrite(ENB, speed);
 }
-
 void turnRight(int speed) {
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
-  analogWrite(ENA, speed);
-  analogWrite(ENB, speed);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  analogWrite(ENA, speed); analogWrite(ENB, speed);
 }
-
 void stopMotors() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENA, 0);
-  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0); analogWrite(ENB, 0);
 }
